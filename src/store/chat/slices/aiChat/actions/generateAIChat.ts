@@ -32,6 +32,8 @@ interface ProcessMessageParams {
    * the RAG query content, should be embedding and used in the semantic search
    */
   ragQuery?: string;
+  threadId?: string;
+  inPortalThread?: boolean;
 }
 
 export interface AIGenerateAction {
@@ -70,7 +72,7 @@ export interface AIGenerateAction {
    */
   internal_fetchAIChatMessage: (
     messages: ChatMessage[],
-    assistantMessageId: string,
+    messageId: string,
     params?: ProcessMessageParams,
   ) => Promise<{
     isFunctionCall: boolean;
@@ -79,7 +81,15 @@ export interface AIGenerateAction {
   /**
    * Resends a specific message, optionally using a trace ID for tracking
    */
-  internal_resendMessage: (id: string, traceId?: string) => Promise<void>;
+  internal_resendMessage: (
+    id: string,
+    params?: {
+      traceId?: string;
+      messages?: ChatMessage[];
+      threadId?: string;
+      inPortalThread?: boolean;
+    },
+  ) => Promise<void>;
   /**
    * Toggles the loading state for AI message generation, managing the UI feedback
    */
@@ -92,6 +102,14 @@ export interface AIGenerateAction {
    * Controls the streaming state of tool calling processes, updating the UI accordingly
    */
   internal_toggleToolCallingStreaming: (id: string, streaming: boolean[] | undefined) => void;
+  /**
+   * Toggles the loading state for AI message reasoning, managing the UI feedback
+   */
+  internal_toggleChatReasoning: (
+    loading: boolean,
+    id?: string,
+    action?: string,
+  ) => AbortController | undefined;
 }
 
 export const generateAIChat: StateCreator<
@@ -102,7 +120,7 @@ export const generateAIChat: StateCreator<
 > = (set, get) => ({
   delAndRegenerateMessage: async (id) => {
     const traceId = chatSelectors.getTraceIdByMessageId(id)(get());
-    get().internal_resendMessage(id, traceId);
+    get().internal_resendMessage(id, { traceId });
     get().deleteMessage(id);
 
     // trace the delete and regenerate message
@@ -110,14 +128,14 @@ export const generateAIChat: StateCreator<
   },
   regenerateMessage: async (id) => {
     const traceId = chatSelectors.getTraceIdByMessageId(id)(get());
-    await get().internal_resendMessage(id, traceId);
+    await get().internal_resendMessage(id, { traceId });
 
     // trace the delete and regenerate message
     get().internal_traceMessage(id, { eventType: TraceEventType.RegenerateMessage });
   },
 
   sendMessage: async ({ message, files, onlyAddUserMessage, isWelcomeQuestion }) => {
-    const { internal_coreProcessMessage, activeTopicId, activeId } = get();
+    const { internal_coreProcessMessage, activeTopicId, activeId, activeThreadId } = get();
     if (!activeId) return;
 
     const fileIdList = files?.map((f) => f.id);
@@ -137,6 +155,7 @@ export const generateAIChat: StateCreator<
       sessionId: activeId,
       // if there is activeTopicId，then add topicId to message
       topicId: activeTopicId,
+      threadId: activeThreadId,
     };
 
     const agentConfig = getAgentChatConfig();
@@ -148,7 +167,7 @@ export const generateAIChat: StateCreator<
     // if autoCreateTopic is enabled, check to whether we need to create a topic
     if (!onlyAddUserMessage && !activeTopicId && agentConfig.enableAutoCreateTopic) {
       // check activeTopic and then auto create topic
-      const chats = chatSelectors.currentChats(get());
+      const chats = chatSelectors.activeBaseChats(get());
 
       // we will add two messages (user and assistant), so the finial length should +2
       const featureLength = chats.length + 2;
@@ -207,12 +226,13 @@ export const generateAIChat: StateCreator<
     }
 
     // Get the current messages to generate AI response
-    const messages = chatSelectors.currentChats(get());
+    const messages = chatSelectors.activeBaseChats(get());
     const userFiles = chatSelectors.currentUserFiles(get()).map((f) => f.id);
 
     await internal_coreProcessMessage(messages, id, {
       isWelcomeQuestion,
       ragQuery: get().internal_shouldUseRAG() ? message : undefined,
+      threadId: activeThreadId,
     });
 
     set({ isCreatingMessage: false }, false, n('creatingMessage/stop'));
@@ -223,7 +243,7 @@ export const generateAIChat: StateCreator<
 
       // check activeTopic and then auto update topic title
       if (newTopicId) {
-        const chats = chatSelectors.currentChats(get());
+        const chats = chatSelectors.activeBaseChats(get());
         await get().summaryTopicTitle(newTopicId, chats);
         return;
       }
@@ -231,7 +251,7 @@ export const generateAIChat: StateCreator<
       const topic = topicSelectors.currentActiveTopic(get());
 
       if (topic && !topic.title) {
-        const chats = chatSelectors.currentChats(get());
+        const chats = chatSelectors.activeBaseChats(get());
         await get().summaryTopicTitle(topic.id, chats);
       }
     };
@@ -247,10 +267,11 @@ export const generateAIChat: StateCreator<
     await Promise.all([summaryTitle(), addFilesToAgent()]);
   },
   stopGenerateMessage: () => {
-    const { abortController, internal_toggleChatLoading } = get();
-    if (!abortController) return;
+    const { chatLoadingIdsAbortController, internal_toggleChatLoading } = get();
 
-    abortController.abort(MESSAGE_CANCEL_FLAT);
+    if (!chatLoadingIdsAbortController) return;
+
+    chatLoadingIdsAbortController.abort(MESSAGE_CANCEL_FLAT);
 
     internal_toggleChatLoading(false, undefined, n('stopGenerateMessage') as string);
   },
@@ -308,6 +329,7 @@ export const generateAIChat: StateCreator<
       parentId: userMessageId,
       sessionId: get().activeId,
       topicId: activeTopicId, // if there is activeTopicId，then add it to topicId
+      threadId: params?.threadId,
       fileChunks,
       ragQueryId,
     };
@@ -320,7 +342,10 @@ export const generateAIChat: StateCreator<
     // 4. if it's the function call message, trigger the function method
     if (isFunctionCall) {
       await refreshMessages();
-      await triggerToolCalls(assistantId);
+      await triggerToolCalls(assistantId, {
+        threadId: params?.threadId,
+        inPortalThread: params?.inPortalThread,
+      });
     }
 
     // 5. summary history if context messages is larger than historyCount
@@ -341,19 +366,20 @@ export const generateAIChat: StateCreator<
       await get().internal_summaryHistory(historyMessages);
     }
   },
-  internal_fetchAIChatMessage: async (messages, assistantId, params) => {
+  internal_fetchAIChatMessage: async (messages, messageId, params) => {
     const {
       internal_toggleChatLoading,
       refreshMessages,
       internal_updateMessageContent,
       internal_dispatchMessage,
       internal_toggleToolCallingStreaming,
+      internal_toggleChatReasoning,
     } = get();
 
     const abortController = internal_toggleChatLoading(
       true,
-      assistantId,
-      n('generateMessage(start)', { assistantId, messages }) as string,
+      messageId,
+      n('generateMessage(start)', { messageId, messages }) as string,
     );
 
     const agentConfig = getAgentConfig();
@@ -395,19 +421,17 @@ export const generateAIChat: StateCreator<
       ? agentConfig.params.max_tokens
       : undefined;
 
-    // 5. handle config for the vision model
-    // Due to the gpt-4-vision-preview model's default max_tokens is very small
-    // we need to set the max_tokens a larger one.
-    if (agentConfig.model === 'gpt-4-vision-preview') {
-      /* eslint-disable unicorn/no-lonely-if */
-      if (!agentConfig.params.max_tokens)
-        // refs: https://github.com/lobehub/lobe-chat/issues/837
-        agentConfig.params.max_tokens = 2048;
-    }
+    // 5. handle reasoning_effort
+    agentConfig.params.reasoning_effort = chatConfig.enableReasoningEffort
+      ? agentConfig.params.reasoning_effort
+      : undefined;
 
     let isFunctionCall = false;
     let msgTraceId: string | undefined;
     let output = '';
+    let thinking = '';
+    let thinkingStartAt: number;
+    let duration: number;
 
     const historySummary = topicSelectors.currentActiveTopicSummary(get());
     await chatService.createAssistantMessageStream({
@@ -428,43 +452,74 @@ export const generateAIChat: StateCreator<
       },
       isWelcomeQuestion: params?.isWelcomeQuestion,
       onErrorHandle: async (error) => {
-        await messageService.updateMessageError(assistantId, error);
+        await messageService.updateMessageError(messageId, error);
         await refreshMessages();
       },
-      onFinish: async (content, { traceId, observationId, toolCalls }) => {
+      onFinish: async (content, { traceId, observationId, toolCalls, reasoning }) => {
         // if there is traceId, update it
         if (traceId) {
           msgTraceId = traceId;
-          await messageService.updateMessage(assistantId, {
+          await messageService.updateMessage(messageId, {
             traceId,
             observationId: observationId ?? undefined,
           });
         }
 
         if (toolCalls && toolCalls.length > 0) {
-          internal_toggleToolCallingStreaming(assistantId, undefined);
+          internal_toggleToolCallingStreaming(messageId, undefined);
         }
 
         // update the content after fetch result
-        await internal_updateMessageContent(assistantId, content, toolCalls);
+        await internal_updateMessageContent(
+          messageId,
+          content,
+          toolCalls,
+          !!reasoning ? { content: reasoning, duration } : undefined,
+        );
       },
       onMessageHandle: async (chunk) => {
         switch (chunk.type) {
           case 'text': {
             output += chunk.text;
+
+            // if there is no duration, it means the end of reasoning
+            if (!duration) {
+              duration = Date.now() - thinkingStartAt;
+              internal_toggleChatReasoning(false, messageId, n('generateMessage(end)') as string);
+            }
+
             internal_dispatchMessage({
-              id: assistantId,
+              id: messageId,
               type: 'updateMessage',
-              value: { content: output },
+              value: {
+                content: output,
+                reasoning: !!thinking ? { content: thinking, duration } : undefined,
+              },
+            });
+            break;
+          }
+          case 'reasoning': {
+            // if there is no thinkingStartAt, it means the start of reasoning
+            if (!thinkingStartAt) {
+              thinkingStartAt = Date.now();
+              internal_toggleChatReasoning(true, messageId, n('generateMessage(end)') as string);
+            }
+
+            thinking += chunk.text;
+
+            internal_dispatchMessage({
+              id: messageId,
+              type: 'updateMessage',
+              value: { reasoning: { content: thinking } },
             });
             break;
           }
 
           // is this message is just a tool call
           case 'tool_calls': {
-            internal_toggleToolCallingStreaming(assistantId, chunk.isAnimationActives);
+            internal_toggleToolCallingStreaming(messageId, chunk.isAnimationActives);
             internal_dispatchMessage({
-              id: assistantId,
+              id: messageId,
               type: 'updateMessage',
               value: { tools: get().internal_transformToolCalls(chunk.tool_calls) },
             });
@@ -474,7 +529,7 @@ export const generateAIChat: StateCreator<
       },
     });
 
-    internal_toggleChatLoading(false, assistantId, n('generateMessage(end)') as string);
+    internal_toggleChatLoading(false, messageId, n('generateMessage(end)') as string);
 
     return {
       isFunctionCall,
@@ -482,9 +537,12 @@ export const generateAIChat: StateCreator<
     };
   },
 
-  internal_resendMessage: async (messageId, traceId) => {
+  internal_resendMessage: async (
+    messageId,
+    { traceId, messages: outChats, threadId: outThreadId, inPortalThread } = {},
+  ) => {
     // 1. 构造所有相关的历史记录
-    const chats = chatSelectors.currentChats(get());
+    const chats = outChats ?? chatSelectors.mainAIChats(get());
 
     const currentIndex = chats.findIndex((c) => c.id === messageId);
     if (currentIndex < 0) return;
@@ -511,21 +569,28 @@ export const generateAIChat: StateCreator<
 
     if (contextMessages.length <= 0) return;
 
-    const { internal_coreProcessMessage } = get();
+    const { internal_coreProcessMessage, activeThreadId } = get();
 
     const latestMsg = contextMessages.findLast((s) => s.role === 'user');
 
     if (!latestMsg) return;
 
+    const threadId = outThreadId ?? activeThreadId;
+
     await internal_coreProcessMessage(contextMessages, latestMsg.id, {
       traceId,
       ragQuery: get().internal_shouldUseRAG() ? latestMsg.content : undefined,
+      threadId,
+      inPortalThread,
     });
   },
 
   // ----- Loading ------- //
   internal_toggleChatLoading: (loading, id, action) => {
     return get().internal_toggleLoadingArrays('chatLoadingIds', loading, id, action);
+  },
+  internal_toggleChatReasoning: (loading, id, action) => {
+    return get().internal_toggleLoadingArrays('reasoningLoadingIds', loading, id, action);
   },
   internal_toggleToolCallingStreaming: (id, streaming) => {
     set(
